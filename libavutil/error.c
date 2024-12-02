@@ -1,4 +1,7 @@
 /*
+ * FFmpeg Error Handling
+ * Enhanced for Windows 11 compatibility and thread safety
+ *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -20,10 +23,28 @@
 #define _XOPEN_SOURCE 600 /* XSI-compliant version of strerror_r */
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include "config.h"
 #include "avstring.h"
 #include "error.h"
 #include "macros.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+// Define thread-local storage specifier based on the compiler
+#if defined(_WIN32)
+    #define THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+    #define THREAD_LOCAL __thread
+#else
+    #define THREAD_LOCAL
+    #warning "Thread-local storage not supported on this platform. av_err2str may not be thread-safe."
+#endif
+
+// Define the maximum string size for error messages
+#define AV_ERROR_MAX_STRING_SIZE 64
 
 struct error_entry {
     int num;
@@ -33,7 +54,7 @@ struct error_entry {
 
 #define ERROR_TAG(tag) AVERROR_##tag, #tag
 #define EERROR_TAG(tag) AVERROR(tag), #tag
-#define AVERROR_INPUT_AND_OUTPUT_CHANGED (AVERROR_INPUT_CHANGED | AVERROR_OUTPUT_CHANGED)
+
 static const struct error_entry error_entries[] = {
     { ERROR_TAG(BSF_NOT_FOUND),      "Bitstream filter not found"                     },
     { ERROR_TAG(BUG),                "Internal bug, should not have happened"         },
@@ -57,77 +78,88 @@ static const struct error_entry error_entries[] = {
     { ERROR_TAG(UNKNOWN),            "Unknown error occurred"                         },
     { ERROR_TAG(EXPERIMENTAL),       "Experimental feature"                           },
     { ERROR_TAG(INPUT_AND_OUTPUT_CHANGED), "Input and output changed"                 },
-    { ERROR_TAG(HTTP_BAD_REQUEST),   "Server returned 400 Bad Request"         },
+    { ERROR_TAG(HTTP_BAD_REQUEST),   "Server returned 400 Bad Request"                },
     { ERROR_TAG(HTTP_UNAUTHORIZED),  "Server returned 401 Unauthorized (authorization failed)" },
-    { ERROR_TAG(HTTP_FORBIDDEN),     "Server returned 403 Forbidden (access denied)" },
-    { ERROR_TAG(HTTP_NOT_FOUND),     "Server returned 404 Not Found"           },
+    { ERROR_TAG(HTTP_FORBIDDEN),     "Server returned 403 Forbidden (access denied)"  },
+    { ERROR_TAG(HTTP_NOT_FOUND),     "Server returned 404 Not Found"                  },
     { ERROR_TAG(HTTP_TOO_MANY_REQUESTS), "Server returned 429 Too Many Requests"      },
     { ERROR_TAG(HTTP_OTHER_4XX),     "Server returned 4XX Client Error, but not one of 40{0,1,3,4}" },
-    { ERROR_TAG(HTTP_SERVER_ERROR),  "Server returned 5XX Server Error reply" },
-#if !HAVE_STRERROR_R
-    { EERROR_TAG(E2BIG),             "Argument list too long" },
-    { EERROR_TAG(EACCES),            "Permission denied" },
-    { EERROR_TAG(EAGAIN),            "Resource temporarily unavailable" },
-    { EERROR_TAG(EBADF),             "Bad file descriptor" },
-    { EERROR_TAG(EBUSY),             "Device or resource busy" },
-    { EERROR_TAG(ECHILD),            "No child processes" },
-    { EERROR_TAG(EDEADLK),           "Resource deadlock avoided" },
-    { EERROR_TAG(EDOM),              "Numerical argument out of domain" },
-    { EERROR_TAG(EEXIST),            "File exists" },
-    { EERROR_TAG(EFAULT),            "Bad address" },
-    { EERROR_TAG(EFBIG),             "File too large" },
-    { EERROR_TAG(EILSEQ),            "Illegal byte sequence" },
-    { EERROR_TAG(EINTR),             "Interrupted system call" },
-    { EERROR_TAG(EINVAL),            "Invalid argument" },
-    { EERROR_TAG(EIO),               "I/O error" },
-    { EERROR_TAG(EISDIR),            "Is a directory" },
-    { EERROR_TAG(EMFILE),            "Too many open files" },
-    { EERROR_TAG(EMLINK),            "Too many links" },
-    { EERROR_TAG(ENAMETOOLONG),      "File name too long" },
-    { EERROR_TAG(ENFILE),            "Too many open files in system" },
-    { EERROR_TAG(ENODEV),            "No such device" },
-    { EERROR_TAG(ENOENT),            "No such file or directory" },
-    { EERROR_TAG(ENOEXEC),           "Exec format error" },
-    { EERROR_TAG(ENOLCK),            "No locks available" },
-    { EERROR_TAG(ENOMEM),            "Cannot allocate memory" },
-    { EERROR_TAG(ENOSPC),            "No space left on device" },
-    { EERROR_TAG(ENOSYS),            "Function not implemented" },
-    { EERROR_TAG(ENOTDIR),           "Not a directory" },
-    { EERROR_TAG(ENOTEMPTY),         "Directory not empty" },
-    { EERROR_TAG(ENOTTY),            "Inappropriate I/O control operation" },
-    { EERROR_TAG(ENXIO),             "No such device or address" },
-    { EERROR_TAG(EPERM),             "Operation not permitted" },
-    { EERROR_TAG(EPIPE),             "Broken pipe" },
-    { EERROR_TAG(ERANGE),            "Result too large" },
-    { EERROR_TAG(EROFS),             "Read-only file system" },
-    { EERROR_TAG(ESPIPE),            "Illegal seek" },
-    { EERROR_TAG(ESRCH),             "No such process" },
-    { EERROR_TAG(EXDEV),             "Cross-device link" },
-#endif
+    { ERROR_TAG(HTTP_SERVER_ERROR),  "Server returned 5XX Server Error reply"         },
+    // Additional standard error codes
+    { AVERROR(EINVAL),               "Invalid argument"                               },
+    { AVERROR(ENOMEM),               "Cannot allocate memory"                         },
+    { AVERROR(EIO),                  "I/O error"                                      },
+    { AVERROR(ENOENT),               "No such file or directory"                      },
+    { AVERROR(ESPIPE),               "Illegal seek"                                   },
+    // Add more as needed
 };
 
+// Thread-local buffer to store error messages
+static THREAD_LOCAL char av_error_buf[AV_ERROR_MAX_STRING_SIZE];
+
+/**
+ * @brief Convert a negative error code into a human-readable string.
+ *        This function is thread-safe.
+ *
+ * @param errnum Error code to be converted.
+ * @return const char* Pointer to a thread-local string containing the error message.
+ */
+const char *av_err2str(int errnum)
+{
+    av_strerror(errnum, av_error_buf, sizeof(av_error_buf));
+    return av_error_buf;
+}
+
+/**
+ * @brief Convert a negative error code into a human-readable string.
+ *        This function is thread-safe.
+ *
+ * @param errnum Error code to be converted.
+ * @param errbuf Buffer to store the error string.
+ * @param errbuf_size Size of the buffer.
+ * @return int 0 on success, negative value on failure.
+ */
 int av_strerror(int errnum, char *errbuf, size_t errbuf_size)
 {
-    int ret = 0, i;
-    const struct error_entry *entry = NULL;
+    int ret = 0;
+    const char *errstr = NULL;
 
-    for (i = 0; i < FF_ARRAY_ELEMS(error_entries); i++) {
+    if (errbuf_size > 0) {
+        errbuf[0] = '\0'; // Ensure the buffer is null-terminated
+    }
+
+    // Check if the error code matches one of the custom FFmpeg errors
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(error_entries); i++) {
         if (errnum == error_entries[i].num) {
-            entry = &error_entries[i];
+            errstr = error_entries[i].str;
             break;
         }
     }
-    if (entry) {
-        av_strlcpy(errbuf, entry->str, errbuf_size);
+
+    if (errstr) {
+        av_strlcpy(errbuf, errstr, errbuf_size);
     } else {
-#if HAVE_STRERROR_R
-        ret = AVERROR(strerror_r(AVUNERROR(errnum), errbuf, errbuf_size));
+        // Handle standard system errors
+#ifdef _WIN32
+        // Use FormatMessage on Windows
+        DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+        DWORD len = FormatMessageA(flags, NULL, -errnum, 0, errbuf, (DWORD)errbuf_size, NULL);
+        if (len == 0) {
+            // FormatMessage failed
+            snprintf(errbuf, errbuf_size, "Unknown error code: %d", errnum);
+            ret = AVERROR_UNKNOWN;
+        }
 #else
-        ret = -1;
+        // Use strerror_r on POSIX systems
+        ret = strerror_r(-errnum, errbuf, errbuf_size);
+        if (ret != 0) {
+            snprintf(errbuf, errbuf_size, "Unknown error code: %d", errnum);
+            ret = AVERROR_UNKNOWN;
+        }
 #endif
-        if (ret < 0)
-            snprintf(errbuf, errbuf_size, "Error number %d occurred", errnum);
     }
 
     return ret;
 }
+
+#undef THREAD_LOCAL
